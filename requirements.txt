@@ -1,0 +1,13 @@
+# Core MCP server (v1)
+fastmcp>=2.0
+
+# HTTP bridges (v1 & v2)
+fastapi>=0.115
+uvicorn>=0.30
+
+# v2 extras
+pexpect>=4.9      # persistent interactive shell
+mss>=9.0          # screenshot fallback
+
+# nice-to-have system stats inside the venv
+psutil>=5.9

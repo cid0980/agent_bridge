@@ -41,6 +41,42 @@ read it before deploying anywhere new, and the next machine skips the entertainm
 - `/admin/audit` — every request logged to `audit.log`. Trust, but verify.
 - v1 compat: `/run` `/read` `/list` `/system-info`
 
+## ⚡ v3.2 speed layer — work FAST, not politely
+
+v3.1 could drive the GUI, but every action needed a follow-up screenshot to
+confirm it. That's 10+ round trips for a 3-step job. v3.2 collapses it:
+
+| do this | not this |
+|---|---|
+| `POST /gui/batch` — N actions **+ one verification shot** | one request per click, then a screenshot each time |
+| `POST /shot {"region":"0,0,900,40","format":"jpg"}` — crop | full 1920×1080 PNG every time (**69× bigger**) |
+| `GET /ff/tabs`, `POST /ff/close {"tabs":[...]}` — DOM | pixel-clicking browser chrome |
+| `GET /status` once — tunnel URL, tabs, daemons, disk | five probes |
+| `POST /safe-kill {"name":"firefox"}` | `pkill -f ...` (can kill your own tunnel) |
+
+```bash
+# one batch = a whole GUI sequence + proof
+curl -s -X POST localhost:8765/gui/batch -H "X-Bridge-Token: $T" \
+  -H "Content-Type: application/json" -d '{"steps":[
+    {"op":"click","x":120,"y":40,"safe":true},
+    {"op":"key","combo":"ctrl+w"},
+    {"op":"sleep","s":0.4},
+    {"op":"shot","region":"0,0,900,40","format":"jpg"}]}'
+
+# close 3 browser tabs in ONE call (no screenshots at all)
+curl -s -X POST localhost:8765/ff/close -H "X-Bridge-Token: $T" \
+  -H "Content-Type: application/json" \
+  -d '{"tabs":["Just a moment","Domain Portfolio","hey - Google"]}'
+```
+
+**Blast-radius guard:** `/run`, `/shell/run` and `/jobs/start` now return
+**409** for any command that would kill `cloudflared` / `agent-tunnel` /
+`agent-bridge` — i.e. the channel itself. Override with `"force": true`.
+App cleanup goes through `/safe-kill`, which refuses those names outright.
+
+**Status:** `pip install pillow` (install.sh/requirements handle it) — without
+Pillow, `region`/`format`/`max_width` are ignored and you get the full PNG.
+
 ## 🚀 Quick install — any PC
 
 **Linux / macOS**

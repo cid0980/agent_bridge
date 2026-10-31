@@ -9,6 +9,10 @@ uvicorn>=0.54       # tested: 0.54.0 (2026)
 pexpect>=4.9        # persistent interactive shells
 mss>=10.0           # X11 screenshot fallback (black frame on Wayland — see ISSUES.md #W1)
 
+# v3.2 speed layer: crop / downscale / JPEG before sending a frame.
+# Without it /shot still works, but always sends a full PNG.
+pillow>=12.0        # tested: 12.3.0 (2026)
+
 # nice-to-have system stats inside the venv
 psutil>=7.0
 

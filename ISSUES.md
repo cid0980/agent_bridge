@@ -22,6 +22,7 @@ and how to avoid every one of these traps on a fresh PC.
 | Tunnel responds with empty body / request hangs | #T1 |
 | Old tunnel URL dead (curl exit 6 / HTTP 000) | #T2 |
 | Screenshot is a 6 KB black PNG on Wayland | #W1 |
+| Bridge went dark right after a cleanup command | #S6 (you killed cloudflared) |
 | gnome-screenshot hangs then segfaults | #W2 |
 | Screenshot D-Bus call = `AccessDenied` | #W3 |
 | Portal screenshot call hangs ~60 s then times out | #W4 |
@@ -31,6 +32,7 @@ and how to avoid every one of these traps on a fresh PC.
 | pkexec'd daemon dies the moment pkexec returns | #D5 |
 | `pgrep ydotoold` matches my own probe → wrong kill | #S3 |
 | Clicks "work" (hover/tooltip visible) but buttons ignore them | #G1 |
+| Agent takes a screenshot per action (slow) | #G8 (use /gui/batch + region crop) |
 | GNOME dock pops up and eats clicks near screen bottom | #G2 |
 | Ctrl+1..8 / Ctrl+PageUp sometimes do nothing in Firefox | #G3 |
 | Tab-strip clicks land on the *wrong* tab | #G4 |
@@ -126,6 +128,28 @@ and how to avoid every one of these traps on a fresh PC.
 - **Fix:** screenshot FIRST ({POST /shot}) before input injection lands anywhere; dialogs are visible instantly in the frame.
 
 ---
+
+### #S6 — I killed my own tunnel with a "cleanup" `pkill` (v3.2 fix)
+- **Symptom:** the agent asks for a desktop cleanup; Firefox and terminals
+  close, then **the whole bridge goes dark** — `curl /health` now returns a
+  Cloudflare `Error 1033 · unable to resolve it` page. Nothing on the PC is
+  broken; the *channel* is gone.
+- **Root cause:** `cloudflared` was being run **manually in one of those
+  terminal windows**. `pkill -x gnome-terminal-server` closed every terminal —
+  including the process group hosting the tunnel. The bridge survived, but
+  there was no tunnel left to reach it.
+- **Rule:** the tunnel and the bridge are the agent's **oxygen**. Never let a
+  generic cleanup pattern (`pkill <app>`, `killall`, `systemctl stop`, logout)
+  reach them.
+- **v3.2 fix:** `/run`, `/shell/run` and `/jobs/start` return **HTTP 409**
+  when a command contains a kill verb *and* one of
+  `cloudflared|agent-tunnel|agent-bridge|bridge_v3`. Override with
+  `"force": true`. App cleanup goes through `POST /safe-kill {"name":"firefox"}`,
+  which refuses those four names outright.
+- **Prevention:** run the tunnel under systemd (`agent-tunnel.service` —
+  `install.sh` sets it up), never in a terminal window; and order any
+  "close everything" as **apps → daemons → services last**
+  (`systemctl --user disable --now agent-bridge agent-tunnel`).
 
 ## 4. 🖼️ Wayland screenshots (#W) — the big one
 
@@ -240,6 +264,27 @@ and how to avoid every one of these traps on a fresh PC.
 
 ---
 
+### #G8 — Screenshot spam: a 3-click job cost 12 full frames (v3.2 fix)
+- **Symptom:** the user notices the agent taking screenshot after screenshot
+  to close a couple of tabs. Each frame is a full 1920×1080 PNG (~0.1–2 MB)
+  and a ~1–2 s round trip, so a trivial job crawls.
+- **Root cause (three, all fixable):**
+  1. `ydotool` is **write-only** — it reports the codes it sent, never what the
+     app did. So every action seems to need a visual confirmation.
+  2. Failures (#G1 dock eating clicks, #G4 tab drift, #G3 focus races) are
+     invisible until the next frame, and each failure costs another frame.
+  3. Full-screen frames were sent to answer a 900×40 question.
+- **v3.2 fix:**
+  - `POST /gui/batch` — N actions **plus one `shot` step** in a single request.
+  - `/shot` accepts `region` (crop), `max_width` (downscale), `format=jpg`
+    → measured on one frame: tab-strip crop **69× smaller**, dialog crop
+    **57×**, half-width JPEG **4.6×**.
+  - Browser work needs no pixels at all: `/ff/tabs`, `/ff/close`, `/ff/click`,
+    `/ff/js` talk to the DOM through Marionette.
+- **Rule:** plan the sequence, fire it as **one batch**, verify with **one**
+  cropped shot. Trust return values (`{"closed": true}`) instead of
+  re-photographing the screen.
+
 ## 7. 🦊 Firefox / Marionette automation (#F) — the escape hatch that ended the war
 
 ### #F1 — Why marionette is the final boss tier
@@ -322,3 +367,12 @@ On the target Linux (Ubuntu/GNOME Wayland tested):
 8. Before any script restarts Firefox: `cp -r ~/snap/firefox/common/.mozilla/firefox/*/sessionstore-backups /tmp/ss_save/` — #F3.
 9. Keep secrets out of browser UI; regenerate anything that leaked — #P1.
 10. When in doubt: look in this file first.
+
+### 11. ✅ v3.2 fast-operating rules (whoever drives next)
+1. `GET /status` first — tunnel URL, daemons, tabs, disk in ONE call.
+2. Browser → Marionette (`/ff/*`); pixels only for non-browser UI.
+3. One `POST /gui/batch` per job, with `{"op":"shot","region":…}` at the end.
+4. Crop before you send: `region`, `max_width`, `format=jpg`.
+5. Apps get `POST /safe-kill`; never a broad `pkill` (#S6).
+6. Long commands → `/jobs/start` + poll, never a held request (#T1).
+7. Shut down in order: apps → daemons → **services last**.

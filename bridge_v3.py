@@ -1,5 +1,5 @@
 """
-bridge_v3.py — local-system-bridge v3.1 · "god mode"
+bridge_v3.py — local-system-bridge v3.2 · "god mode"
 ====================================================
 Everything from v2 (persistent interactive shell, background jobs,
 binary file transfer, screenshot, cron) PLUS:
@@ -14,6 +14,12 @@ binary file transfer, screenshot, cron) PLUS:
                      BONUS: tools_linux/ff_tabs.py = Firefox Marionette driver (DOM clicks
                      by button TEXT — the reliable escape hatch when pixels lose).
 
+  ⚡ v3.2 SPEED  → /gui/batch (N GUI actions + verification shot in ONE request),
+                     cropped/JPEG/downscaled screenshots (region=…), in-process
+                     Marionette endpoints (/ff/tabs /ff/click /ff/close /ff/js /ff/state),
+                     /status one-call dashboard, and a blast-radius guard that REFUSES
+                     to kill the bridge or tunnel (/safe-kill for app cleanup).
+
   📦 self-install  → POST /install {"package": "htop", "manager": "apt|pip|snap"} runs as a job
   🧠 hot-load      → POST /tools/add {"name": "...", "code": "def run(p): ..."} adds a LIVE
                      endpoint with NO restart — the agent extends the bridge itself.
@@ -27,6 +33,7 @@ Tunnel: cloudflared tunnel --url http://127.0.0.1:8765     (named tunnel preferr
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import platform
@@ -200,6 +207,7 @@ class ShellRun(BaseModel):
     command: str
     timeout: int = 30
     session: str = "main"
+    force: bool = False     # bypass the bridge/tunnel self-kill guard (#S6)
 
 
 class ShellType(BaseModel):
@@ -220,6 +228,9 @@ def shell_new(body: ShellNew):
 
 @app.post("/shell/run", dependencies=[Depends(auth)])
 def shell_run(body: ShellRun):
+    warn = _blast_guard(body.command)
+    if warn and not getattr(body, "force", False):
+        raise HTTPException(409, warn)
     return {"session": body.session,
             "output": get_shell(body.session).run(body.command, body.timeout)}
 
@@ -251,6 +262,7 @@ JOBS: dict[str, dict] = {}
 class JobStart(BaseModel):
     command: str
     cwd: str | None = None
+    force: bool = False     # bypass the bridge/tunnel self-kill guard (#S6)
 
 
 def _job_view(jid: str, job: dict) -> dict:
@@ -261,6 +273,9 @@ def _job_view(jid: str, job: dict) -> dict:
 
 @app.post("/jobs/start", dependencies=[Depends(auth)])
 def jobs_start(body: JobStart):
+    warn = _blast_guard(body.command)
+    if warn and not getattr(body, "force", False):
+        raise HTTPException(409, warn)
     cwd = Path(body.cwd).expanduser() if body.cwd else Path.home()
     if not cwd.exists():
         raise HTTPException(400, f"cwd not found: {cwd}")
@@ -429,21 +444,97 @@ def _do_screenshot(dest: Path) -> Path:
                              "See ISSUES.md #W1.")
 
 
+# ------------------------------------------------------------------ #
+# 🖼 VISION — v3.2: CROP / DOWNSCALE / JPEG.                            #
+# A full 1920×1080 PNG costs ~2 MB down the tunnel and ~1–2 s. A       #
+# 900×40 crop of a tab strip costs ~4 KB and answers the same         #
+# question. ALWAYS pass a region when you know where to look.          #
+#   POST /shot {"region":"0,0,900,40","format":"jpg","quality":70}    #
+#   POST /shot {"max_width":960}          ← whole screen, half bytes  #
+#   scale: multiply region coords (HiDPI boxes — this PC = 1.204)     #
+# ------------------------------------------------------------------ #
+def _img_mod():
+    try:
+        from PIL import Image  # pillow — optional, degrades gracefully
+        return Image
+    except Exception:
+        return None
+
+
+class ShotOpts(BaseModel):
+    region: str | None = None       # "x,y,w,h" crop
+    format: str = "png"             # png | jpg
+    quality: int = 75               # jpg quality
+    max_width: int | None = None    # downscale to this width
+    scale: float = 1.0              # region coord multiplier (HiDPI)
+
+
+def _capture(opts: ShotOpts | None = None) -> tuple[bytes, str, dict]:
+    """Screenshot → (bytes, mime, meta). Crop/resize/re-encode when asked."""
+    o = opts or ShotOpts()
+    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time() * 1000)}.png"
+    _do_screenshot(dest)
+    raw = dest.read_bytes()
+    meta: dict = {"captured_bytes": len(raw)}
+    want_more = bool(o.region or o.max_width or o.format.lower() in ("jpg", "jpeg"))
+    if not want_more:
+        return raw, "image/png", meta
+    Image = _img_mod()
+    if Image is None:
+        meta["note"] = "pillow not installed — full PNG returned (pip install pillow)"
+        return raw, "image/png", meta
+    import io as _io
+    img = Image.open(_io.BytesIO(raw)).convert("RGB")
+    meta["w"], meta["h"] = img.size
+    if o.region:
+        try:
+            vals = [float(v) for v in o.region.replace(" ", "").split(",")]
+            if len(vals) != 4:
+                raise ValueError
+        except ValueError:
+            raise HTTPException(400, 'region must be "x,y,w,h", e.g. "0,0,900,40"')
+        sc = o.scale or 1.0
+        x, y, w, h = [int(v * sc) for v in vals]
+        x, y = max(x, 0), max(y, 0)
+        img = img.crop((x, y, min(x + w, img.width), min(y + h, img.height)))
+        meta["region"] = [x, y, img.width, img.height]
+    if o.max_width and img.width > o.max_width:
+        ratio = o.max_width / img.width
+        img = img.resize((int(o.max_width), max(1, int(img.height * ratio))))
+    buf = _io.BytesIO()
+    if o.format.lower() in ("jpg", "jpeg"):
+        img.save(buf, "JPEG", quality=max(1, min(o.quality, 95)), optimize=True)
+        mime = "image/jpeg"
+    else:
+        img.save(buf, "PNG", optimize=True)
+        mime = "image/png"
+    blob = buf.getvalue()
+    meta["sent_bytes"] = len(blob)
+    return blob, mime, meta
+
+
 @app.get("/screenshot", dependencies=[Depends(auth)])
 @app.get("/gui/screenshot", dependencies=[Depends(auth)])
-def screenshot():
-    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time())}.png"
-    return FileResponse(_do_screenshot(dest), filename="screenshot.png")
+def screenshot(region: str | None = None, format: str = "png",
+               quality: int = 75, max_width: int | None = None, scale: float = 1.0):
+    blob, mime, _ = _capture(ShotOpts(region=region, format=format, quality=quality,
+                                      max_width=max_width, scale=scale))
+    dest = Path(tempfile.gettempdir()) / f"out_{int(time.time() * 1000)}"
+    dest = dest.with_suffix(".jpg" if mime == "image/jpeg" else ".png")
+    dest.write_bytes(blob)
+    return FileResponse(dest, filename=dest.name, media_type=mime)
 
 
 @app.post("/shot", dependencies=[Depends(auth)])
-def shot_b64():
-    """One-call vision for the agent: returns json with png base64 + byte size."""
+def shot_b64(opts: ShotOpts | None = None):
+    """One-call vision. Returns base64 + size (and 'captured_bytes' before processing,
+    so you can SEE how much the crop saved)."""
     import base64 as _b64
-    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time()*1000)}.png"
-    _do_screenshot(dest)
-    blob = dest.read_bytes()
-    return {"bytes": len(blob), "png_b64": _b64.b64encode(blob).decode()}
+    blob, mime, meta = _capture(opts)
+    out = {"bytes": len(blob), "mime": mime, "b64": _b64.b64encode(blob).decode(), **meta}
+    if mime == "image/png":
+        out["png_b64"] = out["b64"]          # v3.1 compat
+    return out
 
 
 # ------------------------------------------------------------------ #
@@ -538,27 +629,16 @@ def gui_rawkeys(body: dict):
 @app.post("/gui/click2", dependencies=[Depends(auth)])
 def gui_click2(body: GuiXY):
     """Human-like click: move, settle, press, hold, release."""
-    _ydo("mousemove", "-a", str(body.x), str(body.y))
-    time.sleep(0.25)
-    _ydo("key", f"{_BTN_LEFT}:1")
-    time.sleep(0.12)
-    _ydo("key", f"{_BTN_LEFT}:0")
-    return {"slow_clicked": [body.x, body.y]}
+    r = _slow_click(body.x, body.y)
+    return {"slow_clicked": r["clicked"]}
 
 
 @app.post("/gui/safeclick", dependencies=[Depends(auth)])
 def gui_safeclick(body: GuiXY):
     """Dock-proof click: park the pointer mid-screen first so the GNOME
     auto-hide dash retracts, THEN approach the target directly and click."""
-    park_y = min(body.y - 140, 300)
-    _ydo("mousemove", "-a", str(body.x), str(max(park_y, 60)))
-    time.sleep(1.2)                       # let the dock auto-hide
-    _ydo("mousemove", "-a", str(body.x), str(body.y))
-    time.sleep(0.25)
-    _ydo("key", f"{_BTN_LEFT}:1")
-    time.sleep(0.12)
-    _ydo("key", f"{_BTN_LEFT}:0")
-    return {"safe_clicked": [body.x, body.y]}
+    r = _safe_click(body.x, body.y)
+    return {"safe_clicked": r["clicked"]}
 
 
 class GuiType(BaseModel):
@@ -583,6 +663,416 @@ def gui_click(body: GuiClick):
     _ydo("mousemove", "-a", str(body.x), str(body.y))
     _ydo("click", "0xC0")
     return {"clicked": [body.x, body.y], "hint": "if the target ignores this, use /gui/click2 or /gui/safeclick"}
+
+
+# ======================================================================
+# ⚡ v3.2 SPEED LAYER
+# The v3.1 lesson: a whole GUI sequence cost 10+ round trips because each
+# action needed a follow-up screenshot to confirm it. Fixes here:
+#   /gui/batch  → N actions + a verification shot in ONE request
+#   /ff/*       → Firefox DOM control (no pixels, no coordinate drift)
+#   /status     → one call tells you everything (incl. tunnel URL)
+#   blast guard → /run and friends REFUSE to kill the bridge/tunnel
+# ======================================================================
+
+# ---------- shared pointer/keyboard primitives (no HTTP in here) ----------
+def _slow_click(x: int, y: int) -> dict:
+    """Human-like: move → settle → press → hold → release. Defeats #G1."""
+    _ydo("mousemove", "-a", str(x), str(y))
+    time.sleep(0.25)
+    _ydo("key", f"{_BTN_LEFT}:1")
+    time.sleep(0.12)
+    _ydo("key", f"{_BTN_LEFT}:0")
+    return {"clicked": [x, y], "mode": "slow"}
+
+
+def _safe_click(x: int, y: int) -> dict:
+    """Dock-proof: park mid-screen so the GNOME dash retracts, then click. #G2."""
+    park_y = max(min(y - 140, 300), 60)
+    _ydo("mousemove", "-a", str(x), str(park_y))
+    time.sleep(1.2)
+    _ydo("mousemove", "-a", str(x), str(y))
+    time.sleep(0.25)
+    _ydo("key", f"{_BTN_LEFT}:1")
+    time.sleep(0.12)
+    _ydo("key", f"{_BTN_LEFT}:0")
+    return {"clicked": [x, y], "mode": "safe"}
+
+
+def _key_combo(combo: str) -> dict:
+    parts = [k.strip().lower() for k in combo.split("+") if k.strip()]
+    mods, keys = [], []
+    for k in parts:
+        if k in _MODS:
+            mods.append(_MODS[k])
+        elif k in _KEYCODES:
+            keys.append(_KEYCODES[k])
+        else:
+            raise HTTPException(400, f"unknown key: {k} (mods: {sorted(_MODS)}; keys: {sorted(_KEYCODES)})")
+    if not keys:
+        raise HTTPException(400, "combo needs at least one non-modifier key")
+    _send_keycodes(mods + keys)
+    return {"sent": combo, "codes": mods + keys}
+
+
+# ---------- 🚀 ONE CALL = A WHOLE GUI SEQUENCE ----------
+@app.post("/gui/batch", dependencies=[Depends(auth)])
+def gui_batch(body: dict):
+    """Run a list of GUI actions in ONE round trip.
+
+    {"stop_on_error": true, "steps": [
+        {"op":"click","x":120,"y":40},                  # slow click (default)
+        {"op":"click","x":120,"y":40,"safe":true},      # dock-proof
+        {"op":"move","x":900,"y":500},
+        {"op":"key","combo":"ctrl+w"},
+        {"op":"type","text":"hello"},
+        {"op":"scroll","dy":-5},                        # negative = down
+        {"op":"sleep","s":0.4},
+        {"op":"shot","region":"0,0,900,40","format":"jpg"}   # inline verify
+    ]}
+    Every step returns ok/ms; 'shot' steps return base64 inline.
+    RULE: plan the whole sequence, put ONE shot at the end. Not one shot per step.
+    """
+    steps = body.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        raise HTTPException(400, 'need {"steps": [...]} — see endpoint docstring')
+    stop = bool(body.get("stop_on_error", True))
+    t0, out = time.time(), []
+    for i, st in enumerate(steps):
+        op = str(st.get("op", "")).lower()
+        t = time.time()
+        try:
+            if op == "move":
+                _ydo("mousemove", "-a", str(int(st["x"])), str(int(st["y"])))
+                r = {"moved": [int(st["x"]), int(st["y"])]}
+            elif op == "click":
+                x, y = int(st["x"]), int(st["y"])
+                if st.get("safe"):
+                    r = _safe_click(x, y)
+                elif st.get("slow", True):
+                    r = _slow_click(x, y)
+                else:
+                    _ydo("mousemove", "-a", str(x), str(y))
+                    _ydo("click", "0xC0")
+                    r = {"clicked": [x, y], "mode": "burst"}
+            elif op in ("key", "keys"):
+                r = _key_combo(str(st["combo"]))
+            elif op == "rawkeys":
+                codes = str(st.get("codes", "")).split()
+                if not codes or not all(re.fullmatch(r"\d+:[01]", c) for c in codes):
+                    raise ValueError("codes must look like '29:1 12:1 12:0 29:0'")
+                _ydo("key", *codes)
+                r = {"sent": codes}
+            elif op == "type":
+                _ydo("type", "--", str(st.get("text", "")))
+                r = {"typed": len(str(st.get("text", "")))}
+            elif op == "sleep":
+                s = float(st.get("s", 0.4))
+                time.sleep(max(0.0, min(s, 30.0)))
+                r = {"slept": s}
+            elif op == "scroll":
+                dy = int(st.get("dy", -1))     # ydotool wheel: 0x04 up, 0x05 down
+                btn = "0x04" if dy > 0 else "0x05"
+                for _ in range(abs(dy) or 1):
+                    _ydo("click", btn)
+                    time.sleep(0.05)
+                r = {"scrolled": dy}
+            elif op == "shot":
+                o = ShotOpts(**{k: v for k, v in st.items() if k in ShotOpts.model_fields})
+                blob, mime, meta = _capture(o)
+                import base64 as _b64
+                r = {"bytes": len(blob), "mime": mime, "b64": _b64.b64encode(blob).decode(), **meta}
+            else:
+                raise ValueError(f"unknown op {op!r} (move|click|key|rawkeys|type|sleep|scroll|shot)")
+            out.append({"i": i, "op": op, "ok": True, "ms": int((time.time() - t) * 1000), **r})
+        except Exception as e:
+            out.append({"i": i, "op": op, "ok": False, "ms": int((time.time() - t) * 1000),
+                        "error": str(e)})
+            if stop:
+                break
+    return {"steps": out, "ran": len(out), "of": len(steps),
+            "ms": int((time.time() - t0) * 1000)}
+
+
+# ---------- 🦊 FIREFOX VIA MARIONETTE (in-process, no subprocess) ----------
+_FF_PORT = int(os.environ.get("FF_MARIONETTE_PORT", "2828"))
+
+_FF_STATE_JS = r"""
+const heads=[...document.querySelectorAll('h1,h2,h3')].map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<90).slice(0,4).join(' | ');
+const btns=[...document.querySelectorAll('button,a')].filter(e=>e.offsetParent&&e.offsetHeight>4).map(e=>(e.textContent||'').trim()).filter(t=>t&&t.length<70).slice(0,16).join(', ');
+return 'HEADS: '+heads+' || BTNS: '+btns;
+"""
+
+_FF_CLICK_JS = r"""
+const want = arguments[0];
+const els = [...document.querySelectorAll('button,a,div[role=button],[class*=btn]')].filter(e=>e.offsetParent && e.offsetHeight>4);
+let b = els.find(e => new RegExp(want,'i').test((e.textContent||'').trim()) && (e.textContent||'').trim().length < 80);
+if(!b) return 'NOTFOUND';
+const rect = b.getBoundingClientRect();
+const cx = rect.left + rect.width/2, cy = rect.top + rect.height/2;
+for(const t of ['pointerover','pointermove','pointerdown','mousedown','pointerup','mouseup','click']){
+  const Ctor = t.startsWith('pointer') ? PointerEvent : MouseEvent;
+  b.dispatchEvent(new Ctor(t,{bubbles:true,cancelable:true,clientX:cx,clientY:cy}));
+}
+b.click();
+return 'CLICKED|'+(b.textContent||'').trim().slice(0,50);
+"""
+
+
+class _Marionette:
+    def __init__(self, port: int = _FF_PORT):
+        import socket as _socket
+        self.s = _socket.create_connection(("127.0.0.1", port), 5)
+        self.f = self.s.makefile("rb")
+        self._i = 0
+        self._recv()                       # greeting
+
+    def _recv(self):
+        ln = b""
+        while True:
+            c = self.f.read(1)
+            if not c:
+                raise IOError("marionette closed")
+            if c == b":":
+                break
+            ln += c
+        return json.loads(self.f.read(int(ln)).decode())
+
+    def cmd(self, name: str, params: dict | None = None):
+        self._i += 1
+        b = json.dumps([0, self._i, name, params or {}]).encode()
+        self.s.sendall(str(len(b)).encode() + b":" + b)
+        r = self._recv()
+        if len(r) > 2 and r[2]:
+            raise RuntimeError(f"marionette {name}: {r[2]}")
+        d = r[3] if len(r) > 3 else {}
+        return d.get("value", d) if isinstance(d, dict) else d
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+def _ff() -> _Marionette:
+    try:
+        mc = _Marionette()
+    except OSError as e:
+        raise HTTPException(503, f"Marionette not listening on 127.0.0.1:{_FF_PORT} — start "
+                                 f"Firefox with --marionette (tools_linux/ff_tabs.py marionette-on). "
+                                 f"ISSUES.md #F1/#F2. ({e})")
+    try:
+        mc.cmd("WebDriver:NewSession", {"capabilities": {}})
+    except Exception:
+        pass                            # session already exists — fine
+    return mc
+
+
+def _ff_tabs(mc: _Marionette) -> list[dict]:
+    tabs = []
+    for hid in mc.cmd("WebDriver:GetWindowHandles"):
+        mc.cmd("WebDriver:SwitchToWindow", {"handle": hid})
+        # NOTE: GetCurrentUrl is unreliable (returns None) — titles only. ISSUES.md #F2
+        tabs.append({"id": hid, "title": str(mc.cmd("WebDriver:GetTitle") or "")})
+    return tabs
+
+
+def _ff_target(mc: _Marionette, needle: str | None) -> str:
+    """Resolve a tab by id-prefix OR title substring; default = current tab."""
+    tabs = _ff_tabs(mc)
+    if not needle:
+        if not tabs:
+            raise HTTPException(404, "no tabs open")
+        mc.cmd("WebDriver:SwitchToWindow", {"handle": tabs[0]["id"]})
+        return tabs[0]["id"]
+    n = needle.lower()
+    for t in tabs:
+        if t["id"].startswith(needle) or n in t["title"].lower():
+            mc.cmd("WebDriver:SwitchToWindow", {"handle": t["id"]})
+            return t["id"]
+    raise HTTPException(404, f"no tab matches {needle!r}. open tabs: "
+                             + ", ".join(t["title"][:40] for t in tabs))
+
+
+@app.get("/ff/tabs", dependencies=[Depends(auth)])
+def ff_tabs_list():
+    mc = _ff()
+    try:
+        return {"tabs": _ff_tabs(mc), "count": len(_ff_tabs(mc))}
+    finally:
+        mc.close()
+
+
+@app.post("/ff/state", dependencies=[Depends(auth)])
+def ff_state(body: dict):
+    mc = _ff()
+    try:
+        _ff_target(mc, body.get("tab"))
+        return {"state": mc.cmd("WebDriver:ExecuteScript", {"script": _FF_STATE_JS, "args": []})}
+    finally:
+        mc.close()
+
+
+@app.post("/ff/js", dependencies=[Depends(auth)])
+def ff_js(body: dict):
+    """Arbitrary JS in a tab: {"tab": "gmail", "script": "return document.title"}"""
+    script = body.get("script")
+    if not script:
+        raise HTTPException(400, 'need {"script": "return ..."}')
+    mc = _ff()
+    try:
+        _ff_target(mc, body.get("tab"))
+        return {"result": mc.cmd("WebDriver:ExecuteScript",
+                                 {"script": script, "args": body.get("args") or []})}
+    finally:
+        mc.close()
+
+
+@app.post("/ff/click", dependencies=[Depends(auth)])
+def ff_click(body: dict):
+    """Click by visible TEXT — immune to dock/focus/zoom. {"tab": "...", "text": "Continue"}"""
+    text = str(body.get("text") or "")
+    if not text:
+        raise HTTPException(400, 'need {"text": "button label"}')
+    mc = _ff()
+    try:
+        _ff_target(mc, body.get("tab"))
+        r = mc.cmd("WebDriver:ExecuteScript", {"script": _FF_CLICK_JS, "args": [text]})
+        if str(r).startswith("NOTFOUND"):
+            return {"ok": False, "result": r, "hint": "check /ff/state for real button labels"}
+        return {"ok": True, "result": r}
+    finally:
+        mc.close()
+
+
+@app.post("/ff/close", dependencies=[Depends(auth)])
+def ff_close(body: dict):
+    """Close tabs BY TITLE — one call, many tabs. {"tabs": ["Just a moment", "Domain Portfolio"]}
+    or {"tab": "<id-prefix|title>"} for a single one. Never closes the last remaining window."""
+    needles = body.get("tabs") or ([body["tab"]] if body.get("tab") else [])
+    if not needles:
+        raise HTTPException(400, 'need {"tabs": ["title substring", ...]}')
+    mc = _ff()
+    closed, failed = [], []
+    try:
+        for needle in needles:
+            try:
+                tabs = _ff_tabs(mc)
+                targets = [t for t in tabs
+                           if str(t["id"]).startswith(str(needle))
+                           or str(needle).lower() in t["title"].lower()]
+                if not targets:
+                    failed.append({"needle": needle, "why": "no match"})
+                    continue
+                if len(tabs) - len(targets) < 1:      # keep at least one window
+                    targets = targets[:max(1, len(tabs) - 1)]
+                for t in targets:
+                    mc.cmd("WebDriver:SwitchToWindow", {"handle": t["id"]})
+                    mc.cmd("WebDriver:CloseWindow", {})
+                    closed.append(t["title"][:60])
+            except Exception as e:
+                failed.append({"needle": needle, "why": str(e)})
+        remaining = [t["title"][:40] for t in _ff_tabs(mc)]
+        return {"closed": closed, "failed": failed, "remaining": remaining}
+    finally:
+        mc.close()
+
+
+@app.post("/ff/open", dependencies=[Depends(auth)])
+def ff_open(body: dict):
+    """Open a URL in a new tab: {"url": "https://..."}"""
+    url = str(body.get("url") or "")
+    if not url:
+        raise HTTPException(400, 'need {"url": "..."}')
+    mc = _ff()
+    try:
+        mc.cmd("WebDriver:NewWindow", {"type": "tab"})
+        mc.cmd("WebDriver:NavigateTo", {"url": url})
+        return {"opened": url, "title": str(mc.cmd("WebDriver:GetTitle") or "")}
+    finally:
+        mc.close()
+
+
+# ---------- 🛡 BLAST RADIUS GUARD ----------
+# We killed our own tunnel once with a broad pkill (ISSUES.md #S6).
+# These commands are refused unless force=true.
+_GUARD_CRITICAL = ("cloudflared", "agent-tunnel", "agent-bridge", "bridge_v3")
+_GUARD_VERB = re.compile(r"\b(pkill|killall|kill|systemctl|systemd-run|sudo\s+kill)\b")
+
+
+def _blast_guard(cmd: str) -> str | None:
+    if not cmd or not _GUARD_VERB.search(cmd):
+        return None
+    low = cmd.lower()
+    hits = [n for n in _GUARD_CRITICAL if n in low]
+    if not hits:
+        return None
+    return ("⛔ REFUSED: this command can kill the bridge or the tunnel (" + ", ".join(hits) +
+            ") and that severs the agent's only connection — it happened once (ISSUES.md #S6). "
+            "Use /safe-kill for app cleanup. Pass force=true if you truly mean it.")
+
+
+@app.post("/safe-kill", dependencies=[Depends(auth)])
+def safe_kill(body: dict):
+    """Kill an APP by name, refusing anything that carries the bridge/tunnel."""
+    name = str(body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, 'need {"name": "firefox"}')
+    if any(n in name.lower() for n in _GUARD_CRITICAL):
+        raise HTTPException(403, f"{name!r} is critical to the remote session — refusing.")
+    r = subprocess.run(["pkill", "-x", name], capture_output=True, text=True, timeout=10)
+    alive = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True, timeout=10)
+    return {"killed": name, "rc": r.returncode,
+            "still_running": bool(alive.stdout.strip()),
+            "stderr": r.stderr.strip()[:200]}
+
+
+# ---------- 🩺 ONE-CALL STATUS ----------
+STARTED = time.time()
+BRIDGE_VERSION = "3.2"
+
+
+def _tunnel_url() -> str | None:
+    try:
+        r = subprocess.run(["journalctl", "--user", "-u", "agent-tunnel", "-n", "200", "--no-pager"],
+                           capture_output=True, text=True, timeout=5)
+        found = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", r.stdout or "")
+        return found[-1] if found else None
+    except Exception:
+        return None
+
+
+@app.get("/status", dependencies=[Depends(auth)])
+def status():
+    """Everything about the box in ONE call — use this first after a reconnect."""
+    out: dict = {"version": BRIDGE_VERSION, "uptime_s": int(time.time() - STARTED),
+                 "pid": os.getpid(), "session": os.environ.get("XDG_SESSION_TYPE", "?"),
+                 "wayland": _is_wayland(), "hot_tools": list(_HOT_TOOLS)}
+
+    def _probe(key, fn):
+        try:
+            out[key] = fn()
+        except Exception as e:
+            out[key] = f"ERR: {type(e).__name__}: {e}"
+
+    _probe("tunnel_url", _tunnel_url)
+    _probe("ydotoold", lambda: subprocess.run(["pgrep", "-x", "ydotoold"],
+                                              capture_output=True, timeout=3).returncode == 0)
+    _probe("firefox", lambda: subprocess.run(["pgrep", "-x", "firefox"],
+                                             capture_output=True, timeout=3).returncode == 0)
+    _probe("disk_free_gb", lambda: round(shutil.disk_usage(str(Path.home())).free / 2 ** 30, 1))
+
+    def _ff_count():
+        mc = _ff()
+        try:
+            tabs = _ff_tabs(mc)
+            return {"count": len(tabs), "titles": [t["title"][:45] for t in tabs]}
+        finally:
+            mc.close()
+    _probe("ff_tabs", _ff_count)
+    out["jobs_running"] = sum(1 for j in JOBS.values() if j["proc"].poll() is None)
+    return out
 
 
 # ======================================================================
@@ -739,7 +1229,7 @@ def cron_remove(body: CronLine):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "server": "local-system-bridge v3.1",
+    return {"ok": True, "server": f"local-system-bridge v{BRIDGE_VERSION}",
             "hot_tools": list(_HOT_TOOLS), "sessions": list(_SHELLS)}
 
 
@@ -761,10 +1251,14 @@ def read(path: str):
 class RunBody(BaseModel):
     command: str
     cwd: str | None = None
+    force: bool = False     # bypass the bridge/tunnel self-kill guard (#S6)
 
 
 @app.post("/run", dependencies=[Depends(auth)])
 def run(body: RunBody):
+    warn = _blast_guard(body.command)
+    if warn and not body.force:
+        raise HTTPException(409, warn)
     return {"result": run_command(body.command, body.cwd)}
 
 
@@ -772,10 +1266,12 @@ def run(body: RunBody):
 if __name__ == "__main__":
     src = "BRIDGE_TOKEN env" if os.environ.get("BRIDGE_TOKEN") else "random per start"
     print("=" * 66)
-    print("  local-system-bridge v3.1 · god mode (Wayland-hardened)")
+    print(f"  local-system-bridge v{BRIDGE_VERSION} · god mode (Wayland-hardened + speed layer)")
     print(f"  TOKEN ({src}): {TOKEN}")
     print("  shells (multi) · jobs · files · Wayland screenshot/shot · cron")
-    print("  GUI: open/click/click2/safeclick/type/keys/rawkeys · /tools/add")
+    print("  GUI: open/click/click2/safeclick/type/keys/rawkeys · /gui/batch")
+    print("  FF : /ff/tabs /ff/click /ff/close /ff/js  (Marionette, no pixels)")
+    print("  INFO: /status (tunnel url, tabs, daemons) · /safe-kill · /tools/add")
     print("  audit log:", AUDIT_LOG)
     print("  tunnel: cloudflared tunnel --url http://127.0.0.1:8765")
     print("  READ ISSUES.md FIRST — it encodes a full day of debugging pain.")

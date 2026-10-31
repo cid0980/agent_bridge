@@ -74,6 +74,11 @@ and how to avoid every one of these traps on a fresh PC.
 - **Symptom:** dev laptop (headless) screenshot "works"; user's Wayland desktop shows black.
 - **Lesson:** GUI endpoints only make sense on the *user's actual desktop*. Validate there, not in the build sandbox.
 
+### #C5 — Never restart `agent-bridge.service` from inside the bridge
+- **Symptom:** `systemctl --user restart agent-bridge` via `/run` → request dies with `exit code -15` (SIGTERM) and the reply never comes.
+- **Root cause:** the command runs as a child of the service — restarting the unit kills your own caller.
+- **Fix:** it *did* restart (systemd brought v3.1 back 3 s later); just run the follow-up `/health` check as a SEPARATE request. Rule: service lifecycle commands are fire-and-forget — put the verification in the next call.
+
 ---
 
 ## 2. 🌐 Transport / tunnel issues (#T)

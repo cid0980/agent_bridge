@@ -19,12 +19,36 @@ say "▶ agent-bridge v3 installer ($OS)"
 mkdir -p "$INSTALL_DIR"
 if [ -f "$(dirname "$0")/bridge_v3.py" ]; then
   cp "$(dirname "$0")"/*.py "$(dirname "$0")/requirements.txt" "$INSTALL_DIR/"
+  [ -d "$(dirname "$0")/tools_linux" ] && cp -r "$(dirname "$0")/tools_linux" "$INSTALL_DIR/"
+  [ -f "$(dirname "$0")/ISSUES.md" ] && cp "$(dirname "$0")/ISSUES.md" "$(dirname "$0")/README.md" "$INSTALL_DIR/"
   note "copied repo files -> $INSTALL_DIR"
 else
   warn "bridge_v3.py not found next to install.sh — copy repo files into $INSTALL_DIR first"
   exit 1
 fi
 cd "$INSTALL_DIR"
+
+# --- 1b. Linux GUI support (ISSUES.md #D1/#W1) ---------------------------------
+#     ydotool = pointer/keyboard injection · python3-gi = Wayland screenshots.
+if [ "$OS" = "Linux" ] && command -v apt-get >/dev/null 2>&1; then
+  if command -v ydotool >/dev/null 2>&1 && python3 -c "import gi" 2>/dev/null; then
+    echo -e "${GREEN}✓${RST} ydotool + python3-gi already present"
+  else
+    warn "installing GUI support packages (ydotool, python3-gi)..."
+    sudo apt-get install -y ydotool python3-gi || warn "couldn't install — apt them manually later"
+  fi
+  # the user must be in the 'input' group for the ydotool daemon to accept its
+  # sockets without pkexec. Membership only applies on NEW logins.
+  if ! id -nG "$USER" | grep -qw input; then
+    warn "adding $USER to the 'input' group (needed by ydotoold)..."
+    sudo usermod -aG input "$USER" && warn ">>> LOG OUT & BACK IN once so this group sticks <<<"
+  fi
+  # enable the distro daemon (it runs as root; its socket is fine for the
+  # input group). v3.0 fought this for hours — see ISSUES.md #D1-#D4.
+  systemctl enable --now ydotool.service 2>/dev/null \
+    && echo -e "${GREEN}✓${RST} ydotoold enabled (socket is ready immediately)" \
+    || warn "ydotool.service not available — start ydotoold manually (ISSUES.md #D1)"
+fi
 
 # --- 2. python venv ------------------------------------------------------------
 if ! python3 -m venv .venv 2>/dev/null; then

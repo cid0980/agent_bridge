@@ -1,1 +1,6 @@
-{}
+{
+ "t_smoke": {
+  "code": "def run(p):\n    return {\"hello\": p.get(\"who\",\"world\")}",
+  "method": "POST"
+ }
+}

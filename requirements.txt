@@ -1,13 +1,19 @@
 # Core MCP server (v1)
-fastmcp>=2.0
+fastmcp>=4.0        # tested: 4.1.4 (2026)
 
-# HTTP bridges (v1 & v2)
-fastapi>=0.115
-uvicorn>=0.30
+# HTTP bridge (v2/v3)
+fastapi>=0.162      # tested: 0.162.0 (2026)
+uvicorn>=0.54       # tested: 0.54.0 (2026)
 
-# v2 extras
-pexpect>=4.9      # persistent interactive shell
-mss>=9.0          # screenshot fallback
+# v2/v3 extras
+pexpect>=4.9        # persistent interactive shells
+mss>=10.0           # X11 screenshot fallback (black frame on Wayland — see ISSUES.md #W1)
 
 # nice-to-have system stats inside the venv
-psutil>=5.9
+psutil>=7.0
+
+# ==============================================================================
+# LINUX GUI EXTRAS — system packages, NOT pip (install.sh takes care of these):
+#   ydotool      → pointer & keyboard injection (/gui/* endpoints need ydotoold)
+#   python3-gi   → Wayland portal screenshots (tools_linux/portal_shot.py)
+# ==============================================================================

@@ -1,20 +1,27 @@
 """
-bridge_v3.py — local-system-bridge v3 · "god mode"
-==================================================
+bridge_v3.py — local-system-bridge v3.1 · "god mode"
+====================================================
 Everything from v2 (persistent interactive shell, background jobs,
 binary file transfer, screenshot, cron) PLUS:
 
   🔎 audit log     → every request logged to ~/local-mcp-bridge/audit.log (/admin/audit)
   🐚 multi-shell   → named independent shells: POST /shell/new {"session": "build"}
-  🖱 GUI control   → open any app (/gui/open), click & type via ydotool (/gui/click, /gui/type)
+  🖱 GUI control   → 🔥 v3.1: Wayland-aware /screenshot & /shot (portal, black-screen-proof),
+                     click via ydotool (/gui/click), SLOW reliable clicks (/gui/click2,
+                     /gui/safeclick — defeats GNOME dock interception), key combos
+                     (/gui/keys) and raw evdev codes (/gui/rawkeys), text typing (/gui/type),
+                     /gui/open any app — see ISSUES.md for why these exist.
+                     BONUS: tools_linux/ff_tabs.py = Firefox Marionette driver (DOM clicks
+                     by button TEXT — the reliable escape hatch when pixels lose).
+
   📦 self-install  → POST /install {"package": "htop", "manager": "apt|pip|snap"} runs as a job
   🧠 hot-load      → POST /tools/add {"name": "...", "code": "def run(p): ..."} adds a LIVE
                      endpoint with NO restart — the agent extends the bridge itself.
                      Saved to hot_tools.json so they survive restarts too.
 
-Setup:  pip install fastapi uvicorn pexpect mss
+Setup:  pip install fastapi uvicorn pexpect mss   (Linux GUI extras: ydotool + python3-gi)
 Run:    python bridge_v3.py          (or BRIDGE_TOKEN=xxx python bridge_v3.py)
-Tunnel: cloudflared tunnel --url http://127.0.0.1:8765
+Tunnel: cloudflared tunnel --url http://127.0.0.1:8765     (named tunnel preferred!)
 """
 
 from __future__ import annotations
@@ -367,36 +374,191 @@ def gui_open(body: GuiOpen):
         raise HTTPException(500, f"could not open {target}: {exc}")
 
 
-@app.get("/screenshot", dependencies=[Depends(auth)])
-@app.get("/gui/screenshot", dependencies=[Depends(auth)])
-def screenshot():
-    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time())}.png"
-    for cmd in (["gnome-screenshot", "-f", str(dest)], ["scrot", str(dest)]):
-        try:
-            subprocess.run(cmd, check=True, timeout=15, capture_output=True)
-            return FileResponse(dest, filename="screenshot.png")
-        except Exception:
-            continue
+# ------------------------------------------------------------------ #
+# SCREENSHOTS — v3.1: Wayland-aware (ISSUES.md #W1).                    #
+# On Wayland: mss = black 6 KB frame, gnome-screenshot segfaults.       #
+# The working path on GNOME/Wayland = xdg portal screenshot             #
+# (tools_linux/portal_shot.py — subscribe-before-call pattern),         #
+# invoked with the SYSTEM python3 (needs python3-gi).                   #
+# ------------------------------------------------------------------ #
+def _is_wayland() -> bool:
+    return bool(os.environ.get("WAYLAND_DISPLAY")) or \
+        os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+
+
+def _portal_shot(dest: Path) -> bool:
+    helper = Path(__file__).parent / "tools_linux" / "portal_shot.py"
+    if not helper.exists():
+        helper = Path.home() / "local-mcp-bridge" / "tools_linux" / "portal_shot.py"
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
+    try:
+        r = subprocess.run(["/usr/bin/python3", str(helper), str(dest)],
+                           env=env, capture_output=True, text=True, timeout=40)
+        return r.returncode == 0 and dest.exists() and dest.stat().st_size > 10000
+    except Exception:
+        return False
+
+
+def _do_screenshot(dest: Path) -> Path:
+    # Wayland → portal first, ALWAYS. Legacy tools only as X11 fallbacks.
+    if _is_wayland() and _portal_shot(dest):
+        return dest
+    if not _is_wayland():
+        for cmd in (["gnome-screenshot", "-f", str(dest)], ["scrot", str(dest)]):
+            try:
+                subprocess.run(cmd, check=True, timeout=15, capture_output=True)
+                if dest.exists() and dest.stat().st_size > 10000:
+                    return dest
+            except Exception:
+                continue
+    # last-resort fallbacks (may black-frame on Wayland — caller checks size)
+    if _portal_shot(dest):
+        return dest
     try:
         import mss
         with mss.mss() as sct:
             sct.shot(output=str(dest))
-        return FileResponse(dest, filename="screenshot.png")
-    except Exception as exc:
-        raise HTTPException(500, f"No screenshot tool worked ({exc}). "
-                                 "Try: sudo apt install gnome-screenshot")
+        if dest.exists() and dest.stat().st_size > 10000:
+            return dest
+    except Exception:
+        pass
+    raise HTTPException(500, "no working screenshot path. On Wayland install "
+                             "python3-gi + keep tools_linux/portal_shot.py beside the bridge. "
+                             "See ISSUES.md #W1.")
+
+
+@app.get("/screenshot", dependencies=[Depends(auth)])
+@app.get("/gui/screenshot", dependencies=[Depends(auth)])
+def screenshot():
+    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time())}.png"
+    return FileResponse(_do_screenshot(dest), filename="screenshot.png")
+
+
+@app.post("/shot", dependencies=[Depends(auth)])
+def shot_b64():
+    """One-call vision for the agent: returns json with png base64 + byte size."""
+    import base64 as _b64
+    dest = Path(tempfile.gettempdir()) / f"shot_{int(time.time()*1000)}.png"
+    _do_screenshot(dest)
+    blob = dest.read_bytes()
+    return {"bytes": len(blob), "png_b64": _b64.b64encode(blob).decode()}
+
+
+# ------------------------------------------------------------------ #
+# POINTER/KEYBOARD — via ydotool (v3.1 hardening; see ISSUES.md).      #
+# #G1: bare `click 0xC0` press+release bursts get dropped on some      #
+# Wayland stacks => click2 = human press-hold-release.                 #
+# #G2: the auto-hide GNOME dock EATS clicks near the screen bottom     #
+# => safeclick = park mid-screen, let the dock retract, then click.    #
+# #D2: ydotool needs YDOTOOL_SOCKET env if the daemon uses a custom    #
+# socket — honored here automatically.                                 #
+# ------------------------------------------------------------------ #
+_YDO_ENV = dict(os.environ)
+_YDO_ENV.setdefault("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
 
 
 def _ydo(*args: str) -> str:
     try:
-        r = subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=10, env=_YDO_ENV)
     except FileNotFoundError:
         raise HTTPException(500, "ydotool not installed. Run: POST /install "
                                  '{"package":"ydotool","manager":"apt"} '
-                                 "(and ensure ydotoold is running)")
+                                 "(and ensure ydotoold is running — see ISSUES.md #D1)")
     if r.returncode != 0:
-        raise HTTPException(500, f"ydotool failed: {r.stderr.strip()} (ydotoold running?)")
+        raise HTTPException(500, f"ydotool failed: {r.stderr.strip()} (ydotoold running? stale socket? ISSUES.md #D2)")
     return r.stdout
+
+
+_BTN_LEFT = 272  # evdev BTN_LEFT
+
+
+class GuiKeys(BaseModel):
+    combo: str    # e.g. "ctrl+shift+t", "alt+f4", "f5", "esc"
+
+
+class GuiXY(BaseModel):
+    x: int
+    y: int
+
+
+# full evdev map — proven in live session
+_KEYCODES = {
+    "esc": 1, "enter": 28, "tab": 15, "space": 57, "backspace": 14,
+    "left": 105, "right": 106, "up": 103, "down": 108,
+    "home": 102, "end": 107, "pageup": 104, "pagedown": 109,
+    "delete": 111, "insert": 110, "minus": 12, "equal": 13,
+    **{c: k for c, k in zip("abcdefghijklmnopqrstuvwxyz",
+        [30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44])},
+    **{str(d): k for d, k in enumerate([11, 2, 3, 4, 5, 6, 7, 8, 9, 10])},  # 0..9
+    **{f"f{i}": (58 + i if i <= 10 else 86 + (i - 10)) for i in range(1, 13)},  # f1=59..f10=68, f11=87, f12=88
+}
+_MODS = {"ctrl": 29, "alt": 56, "shift": 42, "super": 125, "meta": 125}
+
+
+def _send_keycodes(codes: list[int], hold_s: float = 0.08) -> None:
+    for c in codes:
+        _ydo("key", f"{c}:1")
+    time.sleep(hold_s)
+    for c in reversed(codes):
+        _ydo("key", f"{c}:0")
+
+
+@app.post("/gui/keys", dependencies=[Depends(auth)])
+def gui_keys(body: GuiKeys):
+    combo = [k.strip().lower() for k in body.combo.split("+") if k.strip()]
+    mods, keys = [], []
+    for k in combo:
+        if k in _MODS:
+            mods.append(_MODS[k])
+        elif k in _KEYCODES:
+            keys.append(_KEYCODES[k])
+        else:
+            raise HTTPException(400, f"unknown key: {k} (known mods: {sorted(_MODS)}; keys: {sorted(_KEYCODES)})")
+    if not keys:
+        raise HTTPException(400, "combo needs at least one non-modifier key")
+    _send_keycodes(mods + keys)
+    return {"sent": body.combo, "codes": mods + keys}
+
+
+@app.post("/gui/rawkeys", dependencies=[Depends(auth)])
+def gui_rawkeys(body: dict):
+    """Arbitrary evdev codes: {"codes": "29:1 12:1 12:0 29:0"} — full-power mode."""
+    codes = (body.get("codes") or "").split()
+    if not codes:
+        raise HTTPException(400, "pass codes like '29:1 12:1 12:0 29:0'")
+    for c in codes:
+        if not re.fullmatch(r"\d+:[01]", c):
+            raise HTTPException(400, f"bad code {c!r} (want N:1/N:0)")
+    _ydo("key", *codes)
+    return {"sent": codes}
+
+
+@app.post("/gui/click2", dependencies=[Depends(auth)])
+def gui_click2(body: GuiXY):
+    """Human-like click: move, settle, press, hold, release."""
+    _ydo("mousemove", "-a", str(body.x), str(body.y))
+    time.sleep(0.25)
+    _ydo("key", f"{_BTN_LEFT}:1")
+    time.sleep(0.12)
+    _ydo("key", f"{_BTN_LEFT}:0")
+    return {"slow_clicked": [body.x, body.y]}
+
+
+@app.post("/gui/safeclick", dependencies=[Depends(auth)])
+def gui_safeclick(body: GuiXY):
+    """Dock-proof click: park the pointer mid-screen first so the GNOME
+    auto-hide dash retracts, THEN approach the target directly and click."""
+    park_y = min(body.y - 140, 300)
+    _ydo("mousemove", "-a", str(body.x), str(max(park_y, 60)))
+    time.sleep(1.2)                       # let the dock auto-hide
+    _ydo("mousemove", "-a", str(body.x), str(body.y))
+    time.sleep(0.25)
+    _ydo("key", f"{_BTN_LEFT}:1")
+    time.sleep(0.12)
+    _ydo("key", f"{_BTN_LEFT}:0")
+    return {"safe_clicked": [body.x, body.y]}
 
 
 class GuiType(BaseModel):
@@ -416,9 +578,11 @@ def gui_type(body: GuiType):
 
 @app.post("/gui/click", dependencies=[Depends(auth)])
 def gui_click(body: GuiClick):
+    # legacy burst click. If it ever silently no-ops on a Wayland desktop,
+    # switch to /gui/click2 (slow) or /gui/safeclick (dock-proof). #G1/#G2
     _ydo("mousemove", "-a", str(body.x), str(body.y))
     _ydo("click", "0xC0")
-    return {"clicked": [body.x, body.y]}
+    return {"clicked": [body.x, body.y], "hint": "if the target ignores this, use /gui/click2 or /gui/safeclick"}
 
 
 # ======================================================================
@@ -575,7 +739,7 @@ def cron_remove(body: CronLine):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "server": "local-system-bridge v3",
+    return {"ok": True, "server": "local-system-bridge v3.1",
             "hot_tools": list(_HOT_TOOLS), "sessions": list(_SHELLS)}
 
 
@@ -608,11 +772,12 @@ def run(body: RunBody):
 if __name__ == "__main__":
     src = "BRIDGE_TOKEN env" if os.environ.get("BRIDGE_TOKEN") else "random per start"
     print("=" * 66)
-    print("  local-system-bridge v3 · god mode")
+    print("  local-system-bridge v3.1 · god mode (Wayland-hardened)")
     print(f"  TOKEN ({src}): {TOKEN}")
-    print("  shells (multi) · jobs · files · screenshot · GUI open/click/type")
-    print("  cron · /install anything · /tools/add = hot-load NEW endpoints")
+    print("  shells (multi) · jobs · files · Wayland screenshot/shot · cron")
+    print("  GUI: open/click/click2/safeclick/type/keys/rawkeys · /tools/add")
     print("  audit log:", AUDIT_LOG)
     print("  tunnel: cloudflared tunnel --url http://127.0.0.1:8765")
+    print("  READ ISSUES.md FIRST — it encodes a full day of debugging pain.")
     print("=" * 66)
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
